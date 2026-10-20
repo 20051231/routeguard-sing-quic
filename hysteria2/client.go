@@ -82,6 +82,8 @@ type Client struct {
 	conn       *clientQUICConnection
 	closeIdle  atomic.Bool
 	pending    *clientOffer
+	// RouteGuard: local identifiers describe published authenticated sessions only.
+	nextSessionID uint64
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -218,6 +220,10 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 	conn, err := c.offerNew(offerCtx)
 	pending.cancel(nil)
+	c.finishOffer(pending, conn, err)
+}
+
+func (c *Client) finishOffer(pending *clientOffer, conn *clientQUICConnection, err error) {
 
 	discardErr := err
 	shouldDiscard := false
@@ -232,6 +238,9 @@ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 		pending.conn = conn
 		pending.err = err
 		if err == nil {
+			c.nextSessionID++
+			conn.sessionID = c.nextSessionID
+			conn.authenticatedAt = time.Now()
 			c.conn = conn
 		}
 	}
@@ -716,20 +725,25 @@ type clientOffer struct {
 }
 
 type clientQUICConnection struct {
-	quicConn     *quic.Conn
-	rawConn      io.Closer
-	closeOnce    sync.Once
-	connDone     chan struct{}
-	connErr      error
-	udpDisabled  bool
-	access       sync.RWMutex
-	udpConnMap   map[uint32]*udpPacketConn
-	udpSessionID uint32
-	streams      int
-	closeIdle    *atomic.Bool
+	sessionID       uint64
+	authenticatedAt time.Time
+	quicConn        *quic.Conn
+	rawConn         io.Closer
+	closeOnce       sync.Once
+	connDone        chan struct{}
+	connErr         error
+	udpDisabled     bool
+	access          sync.RWMutex
+	udpConnMap      map[uint32]*udpPacketConn
+	udpSessionID    uint32
+	streams         int
+	closeIdle       *atomic.Bool
 }
 
 func (c *clientQUICConnection) active() bool {
+	if c.quicConn == nil {
+		return false
+	}
 	select {
 	case <-c.quicConn.Context().Done():
 		return false
@@ -786,8 +800,12 @@ func (c *clientQUICConnection) closeWithError(err error) {
 		for _, udpConn := range udpConnMap {
 			udpConn.closeWithError(err)
 		}
-		_ = c.quicConn.CloseWithError(0, "")
-		_ = c.rawConn.Close()
+		if c.quicConn != nil {
+			_ = c.quicConn.CloseWithError(0, "")
+		}
+		if c.rawConn != nil {
+			_ = c.rawConn.Close()
+		}
 	})
 }
 
